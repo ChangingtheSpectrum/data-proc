@@ -1,0 +1,188 @@
+---
+- name: Deploy Data Processor Microservice Stack
+  hosts: app_servers
+  become: true
+  vars:
+    dataproc_user: "dataproc"
+    dataproc_uid: 2048
+    dataproc_gid: 2048
+    app_install_dir: "/opt/dataproc"
+
+  tasks:
+    # -----------------------------------------------------------
+    # 1. System Preparation & User Management
+    # -----------------------------------------------------------
+    - name: Create dataproc group with GID 2048
+      ansible.builtin.group:
+        name: "{{ dataproc_user }}"
+        gid: "{{ dataproc_gid }}"
+        state: present
+
+    - name: Create dataproc service account with UID 2048
+      ansible.builtin.user:
+        name: "{{ dataproc_user }}"
+        uid: "{{ dataproc_uid }}"
+        group: "{{ dataproc_user }}"
+        shell: /usr/sbin/nologin
+        system: true
+        create_home: false
+        state: present
+
+    # -----------------------------------------------------------
+    # 2. Host Firewall (UFW) Configuration
+    # -----------------------------------------------------------
+    - name: Allow SSH traffic (prevents administrative lockout)
+      community.general.ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+
+    - name: Allow application traffic on port 8080 only
+      community.general.ufw:
+        rule: allow
+        port: '8080'
+        proto: tcp
+
+    - name: Set default incoming traffic policy to deny
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Set default outgoing traffic policy to allow
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Enable UFW firewall
+      community.general.ufw:
+        state: enabled
+
+    # -----------------------------------------------------------
+    # 3. Docker Engine & Compose CLI Plugin Installation
+    # -----------------------------------------------------------
+    - name: Install prerequisite packages for Docker repository
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: true
+
+    - name: Ensure keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download official Docker GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+
+    - name: Add official Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker CE and Docker Compose CLI plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker daemon is active and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # -----------------------------------------------------------
+    # 4. Host Log Preparation
+    # -----------------------------------------------------------
+    - name: Ensure /var/log/nginx directory exists on host
+      ansible.builtin.file:
+        path: /var/log/nginx
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Prepare custom-access.log on host before container starts
+      ansible.builtin.file:
+        path: /var/log/nginx/custom-access.log
+        state: touch
+        owner: root
+        group: root
+        # Nginx alpine worker runs as UID 101. Mode 0666 ensures writable access without permission collision
+        mode: '0666'
+        modification_time: preserve
+        access_time: preserve
+
+    # -----------------------------------------------------------
+    # 5. Application Artifacts & Configuration Templating
+    # -----------------------------------------------------------
+    - name: Create application deployment directory
+      ansible.builtin.file:
+        path: "{{ app_install_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Sync application build files
+      ansible.builtin.copy:
+        src: files/app
+        dest: "{{ app_install_dir }}/"
+        owner: "{{ dataproc_user }}"
+        group: "{{ dataproc_user }}"
+        mode: '0755'
+
+    - name: Template nginx.conf to host
+      ansible.builtin.template:
+        src: templates/nginx.conf.j2
+        dest: "{{ app_install_dir }}/nginx.conf"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Template docker-compose.yml to host
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ app_install_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: '0644'
+
+    # -----------------------------------------------------------
+    # 6. Lifecycle Management via Custom Systemd Unit
+    # -----------------------------------------------------------
+    - name: Template custom systemd service unit
+      ansible.builtin.template:
+        src: templates/dataproc.service.j2
+        dest: /etc/systemd/system/dataproc.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload systemd daemon
+
+    - name: Flush handlers to reload systemd daemon immediately if changed
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start dataproc.service
+      ansible.builtin.systemd:
+        name: dataproc.service
+        state: restarted
+        enabled: true
+
+  handlers:
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
